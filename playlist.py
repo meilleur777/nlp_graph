@@ -1,19 +1,17 @@
-#!/usr/bin/env python
-# coding: utf-8
-
 import json
 import random
 import networkx as nx
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-
-print(plt.get_backend())
+import numpy as np
+import plotly.graph_objects as go # Ensure plotly.graph_objects is imported
 
 # Set up data directory and limit number of playlists
 DATA_DIR = Path('data')
-TOP_K = 1000  # Limit playlists for testing
-FILE_LIMIT = 100  # Load only FILE_LIMIT JSON files instead of all
+TOP_K = 5  # Limit playlists for testing
+FILE_LIMIT = 10  # Load only FILE_LIMIT JSON files instead of all
+MAX_NODES_VISUALIZE = 500  # Limit nodes for visualization performance
 
 # Load JSON Files Efficiently
 files = sorted(DATA_DIR.glob('*.json'))[:FILE_LIMIT]
@@ -62,72 +60,285 @@ for pl in top_playlists:
 
 print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-# Compute Degree Centrality
-deg_cent = nx.degree_centrality(G)
-top_deg = sorted(deg_cent.items(), key=lambda x: x[1], reverse=True)[:10]
-print("\nTop 10 tracks by degree centrality:")
-for node, c in top_deg:
-    data = G.nodes[node]
-    print(f"{data['name']} — {data['artist']} (centrality={c:.4f})")
-
-# Playlist Recommendation Function
-def build_playlist(G, seed_uri, length=10):
-    playlist = [seed_uri]
-    scores = {nbr: G[seed_uri][nbr]['weight'] for nbr in G[seed_uri]}
-    while len(playlist) < length and scores:
-        candidates = {t: s for t, s in scores.items() if t not in playlist}
-        if not candidates:
-            break
-        next_track = max(candidates, key=candidates.get)
-        playlist.append(next_track)
-        for nbr, data in G[next_track].items():
-            if nbr not in playlist:
-                scores[nbr] = scores.get(nbr, 0) + data['weight']
-    return playlist
-
-name_map = {(data['name'].lower(), data['artist'].lower()): uri for uri, data in G.nodes(data=True)}
-
-def recommend_playlist_by_name(seed_name, seed_artist, length=10):
-    key = (seed_name.lower(), seed_artist.lower())
-    if key not in name_map:
-        print(f"Track not found: {seed_name} — {seed_artist}")
-        return
-    seed_uri = name_map[key]
-    recommended = build_playlist(G, seed_uri, length)
-    print(f"\n=== Recommended Playlist (Seed: {seed_name} — {seed_artist}) ===")
-    for i, uri in enumerate(recommended, 1):
-        d = G.nodes[uri]
-        print(f"{i}. {d['name']} — {d['artist']}")
-
-# Example Recommendations
-# recommend_playlist_by_name("Thinking Out Loud", "Ed Sheeran", length=10)
-# recommend_playlist_by_name("Love Yourself", "Justin Bieber", length=10)
-
-# Visualize Graph
-
-# Ensure the graph exists
-if G.number_of_nodes() == 0:
-    print("Graph is empty, skipping visualization.")
-else:
-    # Limit nodes to the top 500 by degree centrality
-    top_nodes = [node for node, _ in sorted(nx.degree_centrality(G).items(), key=lambda x: x[1], reverse=True)[:500]]
-    subgraph = G.subgraph(top_nodes)
-
-    # Choose the layout (spring_layout or kamada_kawai_layout, spring_layout takes longer time)
-    # pos = nx.spring_layout(subgraph, seed=42)
-    pos = nx.kamada_kawai_layout(subgraph)
-
-    # Filter edges to show only strong connections according to weight
-    filtered_edges = [(u, v) for u, v, d in subgraph.edges(data=True) if d['weight'] >=0]
-
-    # Graph Visualization
-    plt.figure(figsize=(12, 12))
-    nx.draw_networkx_nodes(subgraph, pos, node_size=50, alpha=0.8, node_color="#1DB954")
-    nx.draw_networkx_edges(subgraph, pos, edgelist=filtered_edges, alpha=1)
+def filter_graph_for_visualization(G, max_nodes=MAX_NODES_VISUALIZE):
+    """Filter graph to most important nodes for better visualization performance"""
+    if G.number_of_nodes() <= max_nodes:
+        return G
     
-    # Optional: Show track names (shortened for readability)
-    labels = {node: data['name'][:15] for node, data in subgraph.nodes(data=True)}
-    nx.draw_networkx_labels(subgraph, pos, labels, font_size=8)
+    print(f"Filtering graph from {G.number_of_nodes()} to {max_nodes} nodes for visualization...")
+    
+    # Get nodes by degree centrality (most connected nodes)
+    centrality = nx.degree_centrality(G)
+    top_nodes = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+    top_node_ids = [node for node, _ in top_nodes]
+    
+    # Create subgraph with top nodes
+    subgraph = G.subgraph(top_node_ids).copy()
+    print(f"Filtered graph: {subgraph.number_of_nodes()} nodes, {subgraph.number_of_edges()} edges")
+    
+    return subgraph
 
-    plt.title("Track Co-occurrence Graph", fontsize=14)
-    plt.show()
+def nx_to_plotly_optimized(G):
+    """Optimized conversion from NetworkX to Plotly with edge weights as thickness"""
+    
+    # Use faster layout for larger graphs
+    if G.number_of_nodes() > 200:
+        pos = nx.spring_layout(G, k=1, iterations=20)  # Fewer iterations for speed
+    else:
+        pos = nx.kamada_kawai_layout(G)
+    
+    # Get edge weights and normalize them for thickness
+    edge_weights = []
+    edges_list = list(G.edges(data=True))
+    
+    for edge in edges_list:
+        weight = edge[2].get('weight', 1)
+        edge_weights.append(weight)
+    
+    # Normalize weights to reasonable line widths (0.5 to 4.0)
+    if edge_weights:
+        min_weight = min(edge_weights)
+        max_weight = max(edge_weights)
+        weight_range = max_weight - min_weight if max_weight > min_weight else 1
+        
+        normalized_weights = []
+        for weight in edge_weights:
+            normalized = 0.5 + ((weight - min_weight) / weight_range) * 3.5
+            normalized_weights.append(normalized)
+    else:
+        normalized_weights = [1.0] * len(edges_list)
+    
+    # Build edge traces - separate trace for each edge to allow individual styling
+    edge_traces = []
+    
+    for i, (edge, weight) in enumerate(zip(edges_list, normalized_weights)):
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        
+        edge_trace = {
+            'type': 'scatter',
+            'x': [x0, x1, None],
+            'y': [y0, y1, None],
+            'mode': 'lines',
+            'line': {
+                'width': weight,
+                'color': 'rgba(125,125,125,0.6)'
+            },
+            'hoverinfo': 'text',
+            'hovertext': f"Weight: {edge_weights[i]}",
+            'showlegend': False,
+            'name': f'edge_{i}'
+        }
+        edge_traces.append(edge_trace)
+    
+    # Get node positions
+    nodes = list(G.nodes())
+    node_x = [pos[node][0] for node in nodes]
+    node_y = [pos[node][1] for node in nodes]
+    
+    # Create hover text with track info
+    hover_texts = []
+    for node in nodes:
+        data = G.nodes[node]
+        # Calculate weighted degree for this node
+        weighted_degree = sum(G[node][neighbor].get('weight', 1) for neighbor in G[node])
+        
+        hover_text = f"<b>{data.get('name', 'Unknown')}</b><br>"
+        hover_text += f"Artist: {data.get('artist', 'Unknown')}<br>"
+        hover_text += f"Album: {data.get('album', 'Unknown')}<br>"
+        hover_text += f"Connections: {G.degree(node)}<br>"
+        hover_text += f"Weighted Degree: {weighted_degree}"
+        hover_texts.append(hover_text)
+    
+    # Create node sizes based on weighted degree
+    weighted_degrees = []
+    for node in nodes:
+        weighted_degree = sum(G[node][neighbor].get('weight', 1) for neighbor in G[node])
+        weighted_degrees.append(weighted_degree)
+    
+    max_weighted_degree = max(weighted_degrees) if weighted_degrees else 1
+    min_size, max_size = 8, 25
+    node_sizes = [min_size + (degree / max_weighted_degree) * (max_size - min_size) 
+                  for degree in weighted_degrees]
+    
+    # Create node trace
+    node_trace = {
+        'type': 'scatter',
+        'x': node_x,
+        'y': node_y,
+        'mode': 'markers',
+        'hoverinfo': 'text',
+        'hovertext': hover_texts,
+        'marker': {
+            'size': node_sizes,
+            'color': '#1DB954',
+            'line': {'width': 1, 'color': 'white'},
+            'opacity': 0.8
+        },
+        'showlegend': False,
+        'name': 'nodes'
+    }
+    
+    return edge_traces, node_trace, pos, nodes
+
+def create_interactive_graph(G, save_filename=None):
+    """Create interactive graph with edge weights and hover highlighting"""
+
+    # Filter graph for better performance
+    filtered_G = filter_graph_for_visualization(G)
+
+    # Convert to Plotly format
+    edge_traces, node_trace, pos, nodes = nx_to_plotly_optimized(filtered_G)
+
+    # Create the figure
+    fig = go.Figure()
+
+    # Add all edge traces
+    for edge_trace in edge_traces:
+        fig.add_trace(go.Scatter(**edge_trace))
+
+    # Add node trace
+    fig.add_trace(go.Scatter(**node_trace))
+
+    # Update layout (as you had it)
+    fig.update_layout(
+        title=dict(
+            text=f"Interactive Spotify Network ({filtered_G.number_of_nodes()} tracks, {filtered_G.number_of_edges()} connections)",
+            x=0.5,
+            font=dict(size=16)
+        ),
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=20, l=5, r=5, t=60),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor='white'
+    )
+
+    # Build node connections mapping for JavaScript
+    node_connections = {}
+    for i, node in enumerate(nodes):
+        neighbors = list(filtered_G[node].keys())
+        neighbor_indices = [nodes.index(neighbor) for neighbor in neighbors if neighbor in nodes]
+        node_connections[i] = neighbor_indices
+
+    # Create custom HTML with JavaScript for hover highlighting
+    html_template = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
+            #graph { width: 100%; height: 90vh; }
+            .info { margin-bottom: 10px; font-size: 12px; color: #666; }
+        </style>
+    </head>
+    <body>
+        <div class="info">
+            Edge thickness = co-occurrence strength | Node size = weighted connections | Hover over nodes to highlight neighbors
+        </div>
+        <div id="graph"></div>
+
+        <script>
+            // Graph data will be inserted here
+            var graphData = GRAPH_DATA_PLACEHOLDER;
+            var layout = LAYOUT_PLACEHOLDER;
+            var nodeConnections = NODE_CONNECTIONS_PLACEHOLDER;
+
+            // Plot the graph
+            Plotly.newPlot('graph', graphData, layout, {displayModeBar: true, responsive: true});
+
+            var graphDiv = document.getElementById('graph');
+            var originalColors = [];
+            var originalSizes = [];
+            var isHighlighting = false;
+
+            // Store original node properties
+            var nodeTraceIndex = graphData.length - 1; // Last trace is nodes
+            if (nodeTraceIndex >= 0 && graphData[nodeTraceIndex] && graphData[nodeTraceIndex].marker) {
+                originalColors = [...graphData[nodeTraceIndex].marker.color];
+                originalSizes = [...graphData[nodeTraceIndex].marker.size];
+            } else {
+                 console.warn("Could not find node trace or its marker properties for initial setup.");
+            }
+
+            // Hover event to highlight connected nodes
+            graphDiv.on('plotly_hover', function(data) {
+                if (isHighlighting) return;
+                isHighlighting = true;
+
+                var pointIndex = data.points[0].pointIndex;
+                var traceIndex = data.points[0].curveNumber; // Use curveNumber for trace index
+
+                // Only highlight if hovering over nodes (the node trace)
+                if (traceIndex === nodeTraceIndex) {
+                    var connectedNodes = nodeConnections[pointIndex] || [];
+                    var newColors = [...originalColors];
+                    var newSizes = [...originalSizes];
+
+                    // Highlight connected nodes with mint green
+                    connectedNodes.forEach(function(nodeIdx) {
+                        newColors[nodeIdx] = '#00FF9F'; // Mint green
+                        newSizes[nodeIdx] = originalSizes[nodeIdx] + 5;
+                    });
+
+                    // Update the node trace
+                    Plotly.restyle('graph', {
+                        'marker.color': [newColors],
+                        'marker.size': [newSizes]
+                    }, nodeTraceIndex);
+                }
+
+                setTimeout(function() { isHighlighting = false; }, 100);
+            });
+
+            // Unhover event to reset colors
+            graphDiv.on('plotly_unhover', function(data) {
+                if (data && data.points && data.points.length > 0 && data.points[0].curveNumber === nodeTraceIndex) {
+                    Plotly.restyle('graph', {
+                        'marker.color': [originalColors],
+                        'marker.size': [originalSizes]
+                    }, nodeTraceIndex);
+                }
+            });
+        </script>
+    </body>
+    </html>
+    '''
+
+    # Save as HTML with custom interactivity
+    if save_filename:
+        try:
+            html_filename = save_filename.replace('.svg', '.html')
+
+            # Get the dictionary representation of the figure
+            fig_dict = fig.to_dict()
+
+            # Extract data and layout, which are now serializable dictionaries
+            graph_data_json = json.dumps(fig_dict['data'])
+            layout_json = json.dumps(fig_dict['layout'])
+            node_connections_json = json.dumps(node_connections)
+
+            # Create custom HTML with hover highlighting
+            html_content = html_template
+            html_content = html_content.replace('GRAPH_DATA_PLACEHOLDER', graph_data_json)
+            html_content = html_content.replace('LAYOUT_PLACEHOLDER', layout_json)
+            html_content = html_content.replace('NODE_CONNECTIONS_PLACEHOLDER', node_connections_json)
+
+            with open(html_filename, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"Interactive graph saved to {html_filename}")
+
+        except Exception as e:
+            print(f"Error creating custom HTML with JavaScript: {e}")
+            # Fallback to regular HTML save
+            html_filename = save_filename.replace('.svg', '.html')
+            fig.write_html(html_filename)
+            print(f"Fallback: Interactive graph saved to {html_filename} using default write_html.")
+
+    return fig
+
+# Create and save the interactive graph
+filename = f"graph_topK{TOP_K}_fileLimit{FILE_LIMIT}.svg"
+fig = create_interactive_graph(G, save_filename=filename)
